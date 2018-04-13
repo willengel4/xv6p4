@@ -106,20 +106,35 @@ userinit(void)
 int
 growproc(int n)
 {
+  struct proc *p;
+
   uint sz;
   
+  acquire(&ptable.lock);
   sz = proc->sz;
   if(n > 0){
-    if((sz = allocuvm(proc->pgdir, sz, sz + n)) == 0)
+    if((sz = allocuvm(proc->pgdir, sz, sz + n)) == 0){
+    	release(&ptable.lock);
       return -1;
+    }
   } else if(n < 0){
-    if((sz = deallocuvm(proc->pgdir, sz, sz + n)) == 0)
+    if((sz = deallocuvm(proc->pgdir, sz, sz + n)) == 0){
+    	release(&ptable.lock);
       return -1;
+    }
+  }
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+      	/*if not a thread then keep scanning the pg table*/
+        if(p->pgdir != proc->pgdir )
+        	continue;
+        p->sz=sz;
   }
   proc->sz = sz;
+  release(&ptable.lock);
   switchuvm(proc);
   return 0;
 }
+
 
 // Create a new process copying p as the parent.
 // Sets up stack to return as if from system call.
@@ -152,16 +167,72 @@ fork(void)
     if(proc->ofile[i])
       np->ofile[i] = filedup(proc->ofile[i]);
   np->cwd = idup(proc->cwd);
- 
+
   pid = np->pid;
   np->state = RUNNABLE;
   safestrcpy(np->name, proc->name, sizeof(proc->name));
   return pid;
 }
 
+//clone system call
+int
+clone(void)
+{
+	uint ustack[2];
+	void(*fcn)(void*);
+	void *arg;
+	void *stack;
+
+	if(argptr(0, (void*)&fcn, sizeof(fcn) < 0))
+		return -1;
+	if(argptr(1, (void*)&arg, sizeof(arg) < 0))
+			return -1;
+	if(argptr(2, (void*)&stack, sizeof(stack) < 0)){
+			return -1;
+	}
+	int i, pid;
+	struct proc *np;
+
+	if((uint)stack%PGSIZE!=0){
+		return -1;
+	}
+	if((proc->sz - (uint)stack) < PGSIZE){
+		return -1;
+	}
+
+	// Allocate process.
+	if((np = allocproc()) == 0)
+	return -1;
+
+	// Copy process state from p.
+	np->pgdir = proc->pgdir;
+	np->sz = proc->sz;
+	np->parent = proc;
+	*np->tf = *proc->tf;
+	np->tf->esp = (uint)stack+PGSIZE;
+	np->tstack = (uint)stack;
+	ustack[0] = 0xffffffff;
+	ustack[1] = (uint)arg;
+	np->tf->esp -= (2)*4;
+	copyout(np->pgdir, np->tf->esp, ustack, (2)*4);
+	 //Clear %eax so that fork returns 0 in the child.
+	np->tf->eax = 0;
+	np->tf->eip = (uint)fcn;
+	np->tf->ebp = np->tf->esp;
+
+	 for(i = 0; i < NOFILE; i++)
+	    if(proc->ofile[i])
+	      np->ofile[i] = filedup(proc->ofile[i]);
+	np->cwd = idup(proc->cwd);
+
+	pid = np->pid;
+	np->state = RUNNABLE;
+	safestrcpy(np->name, proc->name, sizeof(proc->name));
+	return pid;
+}
 // Exit the current process.  Does not return.
 // An exited process remains in the zombie state
-// until its parent calls wait() to find out it exited.
+// until its parent calls wait() to find out it exited
 void
 exit(void)
 {
@@ -190,9 +261,21 @@ exit(void)
   // Pass abandoned children to init.
   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
     if(p->parent == proc){
-      p->parent = initproc;
-      if(p->state == ZOMBIE)
-        wakeup1(initproc);
+
+    	/*if it is a thread then clear the parent value of the thread. else will cause problem in wait method*/
+      if(p->pgdir != proc->pgdir){
+    	  p->parent = initproc;
+		  if(p->state == ZOMBIE)
+			wakeup1(initproc);
+      }
+      else{
+    	  /*when parent exits , if it has threads then need to set parent of thread to 0 .
+    	  When shell is waiting for parent , it checks if parent has children. so if the parent field of thread is not cleared then in wait the
+    	  threa's parent will be set to initproc . then shell will start again . some confusion will happen */
+    	  p->parent = 0;
+    	  p->state =ZOMBIE;
+      }
+
     }
   }
 
@@ -202,6 +285,51 @@ exit(void)
   panic("zombie exit");
 }
 
+int
+join(void)
+{
+  void **stack;
+  if(argptr(0, (void*)&stack, sizeof(stack) < 0))
+			return -1;
+  if((proc->sz-(uint)stack)< sizeof(void**))
+	  return -1;
+  struct proc *p;
+  int havethreads, pid;
+
+  acquire(&ptable.lock);
+  for(;;){
+    // Scan through table looking for zombie threads.
+	havethreads = 0;
+    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    	/*if not a thread then keep scanning the pg table*/
+      if(p->pgdir != proc->pgdir )
+        continue;
+      if(p->parent != proc )
+              continue;
+	  havethreads = 1;
+
+      if(p->state == ZOMBIE ){
+    	pid = p->pid;
+        p->state = UNUSED;
+        p->pid = 0;
+        p->parent = 0;
+        p->name[0] = 0;
+        p->killed = 0;
+        *((int*)((int*)stack))=p->tstack;
+        release(&ptable.lock);
+        return pid;
+      }
+    }
+
+    // No point waiting if we don't have any children.
+    if(!havethreads || proc->killed){
+      release(&ptable.lock);
+      return -1;
+    }
+    // Wait for children to exit.  (See wakeup1 call in proc_exit.)
+    sleep(proc, &ptable.lock);  //DOC: wait-sleep
+  }
+}
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
 int
@@ -217,7 +345,12 @@ wait(void)
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
       if(p->parent != proc)
         continue;
+      /*if the p is a thread of parent then do not wait. wait only for child.*/
+      if(p->pgdir == proc->pgdir && p->pid!=0 && p->state == ZOMBIE)//TODO Why p->state ==ZOMBIE
+//      if(p->pgdir == proc->pgdir)
+         continue;
       havekids = 1;
+
       if(p->state == ZOMBIE){
         // Found one.
         pid = p->pid;

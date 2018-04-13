@@ -342,6 +342,7 @@ uva2ka(pde_t *pgdir, char *uva)
 // Copy len bytes from p to user address va in page table pgdir.
 // Most useful when pgdir is not the current page table.
 // uva2ka ensures this only works for PTE_U pages.
+//copyout(pgdir, sp, ustack, (3+argc+1)*4)
 int
 copyout(pde_t *pgdir, uint va, void *p, uint len)
 {
